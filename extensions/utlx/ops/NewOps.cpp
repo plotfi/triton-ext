@@ -604,8 +604,6 @@ void utlx::createAsyncLoad(TritonOpBuilder &self,
                            std::vector<mlir::Value> &operands) {
   if (operands.size() < 4)
     return;
-  // The op is "ttg.async_copy_global_to_local"
-  // For now, use runtime op creation since the signature may vary
   mlir::Value src = operands[1];
   mlir::Value result = operands[2];
 
@@ -617,32 +615,37 @@ void utlx::createAsyncLoad(TritonOpBuilder &self,
     return;
   bool useBulk = *useBulkVal != 0;
 
+  // ttg.async_copy_global_to_local carries AttrSizedOperandSegments, so it
+  // needs an operandSegmentSizes attribute describing how its operands split
+  // into (src, result, mask, other). createRuntimeOp builds from a bare
+  // OperationState and never sets it, which left the verifier computing a
+  // total segment size of 0 and rejecting every such op with "operand count
+  // (N) does not match with the total size (0)". The op exists upstream, so
+  // use the generated builder instead of runtime lookup -- it fills the
+  // segment sizes in for us, and type-checks the operands besides.
+  mlir::Value mask;
+  mlir::Value other;
   if (useBulk) {
     // operands: [result_slot, src, result, bulk_size, barrier, useBulk=1]
     if (operands.size() < 6)
       return;
-    // Bulk async load is effectively a barrier-based TMA copy
-    // Use AsyncCopyGlobalToLocalOp with bulk parameters
-    // For now, create as runtime op since bulk variant may differ
-    llvm::SmallVector<mlir::Value> opOperands = {src, result};
-    auto *op = createRuntimeOp(
-        self.getBuilder(), self.getLastLoc(), "ttg.async_copy_global_to_local",
-        {self.getBuilder().getType<ttg::AsyncTokenType>()}, opOperands);
-    if (op && op->getNumResults() > 0)
-      operands[0] = op->getResult(0);
+    // The bulk form carries no mask/other; its size and barrier operands are
+    // not part of this op's signature.
   } else {
-    // Non-bulk: operands[1]=src, operands[2]=result, then optional mask/other,
-    // then useBulk=0
-    llvm::SmallVector<mlir::Value> opOperands = {src, result};
-    // Add mask and other if present (operands between result and useBulk flag)
-    for (size_t i = 3; i < operands.size() - 1; ++i)
-      opOperands.push_back(operands[i]);
-    auto *op = createRuntimeOp(
-        self.getBuilder(), self.getLastLoc(), "ttg.async_copy_global_to_local",
-        {self.getBuilder().getType<ttg::AsyncTokenType>()}, opOperands);
-    if (op && op->getNumResults() > 0)
-      operands[0] = op->getResult(0);
+    // Non-bulk: [result_slot, src, result, (mask)?, (other)?, useBulk=0].
+    // Anything between result and the trailing flag is mask, then other.
+    size_t extra = operands.size() - 4;
+    if (extra >= 1)
+      mask = operands[3];
+    if (extra >= 2)
+      other = operands[4];
   }
+
+  auto copy = self.getBuilder().create<ttg::AsyncCopyGlobalToLocalOp>(
+      self.getLastLoc(), src, result, mask, other,
+      mlir::triton::CacheModifier::NONE, mlir::triton::EvictionPolicy::NORMAL,
+      /*isVolatile=*/false);
+  operands[0] = copy.getToken();
 }
 
 /// utlx_global_scratch_alloc(result_slot, nbytes, alignment) -> ptr
