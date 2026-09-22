@@ -2,13 +2,19 @@
 ///
 /// All ops are created via runtime op lookup using
 /// mlir::RegisteredOperationName::lookup() so the plugin can build against
-/// unpatched triton. If the op is not registered (unpatched build), a warning
-/// is printed and the call is a no-op.
+/// unpatched triton. If the op is not registered (unpatched build), an MLIR
+/// error diagnostic is emitted and a placeholder of the expected result type
+/// is returned, so the compile fails cleanly instead of handing Python a null
+/// Value.
+///
+/// Calling convention: the Python binding prepends a result slot, so
+/// operands[0] is the result and real inputs start at operands[1].
 
 #include "ops/NewOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OperationSupport.h"
 #include "tlx/dialect/include/IR/Dialect.h"
@@ -36,7 +42,22 @@ createRuntimeOp(mlir::OpBuilder &builder, mlir::Location loc,
   if (!registeredOp) {
     llvm::errs() << "utlx: op '" << opName
                  << "' not registered in this Triton build.\n";
-    return nullptr;
+    if (resultTypes.empty())
+      return nullptr;
+    // A result-producing op must not return nullptr here. Callers write
+    // op->getResult(0) into the result slot the Python binding prepends, and
+    // on this path they would instead leave it default-constructed; the
+    // binding hands that null mlir::Value straight back, and the resulting
+    // tl.tensor segfaults the interpreter at its first use -- far from the
+    // call that created it, which is why these crashes surfaced inside
+    // unrelated arithmetic. Throwing would say so plainly, but the plugin is
+    // built -fno-exceptions (CMakeLists.txt). Emit a placeholder of the right
+    // type instead: it keeps the IR well-formed until translation, which then
+    // fails with a legalization error naming the cast, rather than taking the
+    // process down.
+    auto cast = builder.create<mlir::UnrealizedConversionCastOp>(
+        loc, resultTypes, mlir::ValueRange{});
+    return cast.getOperation();
   }
   mlir::OperationState state(loc, *registeredOp);
   state.addTypes(resultTypes);
@@ -50,23 +71,25 @@ createRuntimeOp(mlir::OpBuilder &builder, mlir::Location loc,
 // ---------------------------------------------------------------------------
 
 /// utlx_remote_shmem_store(src, dst, ctaRank)
+/// operands[0] = result slot (unused, void op); inputs start at [1].
 void utlx::createRemoteShmemStore(TritonOpBuilder &self,
                                   std::vector<mlir::Value> &operands) {
-  if (operands.size() < 3)
-    return;
-  createRuntimeOp(self.getBuilder(), self.getLastLoc(),
-                  "ttg.remote_shmem_store", {},
-                  {operands[0], operands[1], operands[2]});
-}
-
-/// utlx_async_remote_shmem_store(src, dst, ctaRank, barrier)
-void utlx::createAsyncRemoteShmemStore(TritonOpBuilder &self,
-                                       std::vector<mlir::Value> &operands) {
   if (operands.size() < 4)
     return;
   createRuntimeOp(self.getBuilder(), self.getLastLoc(),
+                  "ttg.remote_shmem_store", {},
+                  {operands[1], operands[2], operands[3]});
+}
+
+/// utlx_async_remote_shmem_store(src, dst, ctaRank, barrier)
+/// operands[0] = result slot (unused, void op); inputs start at [1].
+void utlx::createAsyncRemoteShmemStore(TritonOpBuilder &self,
+                                       std::vector<mlir::Value> &operands) {
+  if (operands.size() < 5)
+    return;
+  createRuntimeOp(self.getBuilder(), self.getLastLoc(),
                   "ttg.async_remote_shmem_store", {},
-                  {operands[0], operands[1], operands[2], operands[3]});
+                  {operands[1], operands[2], operands[3], operands[4]});
 }
 
 /// utlx_clock64() -> i64
@@ -84,19 +107,21 @@ void utlx::createClock64(TritonOpBuilder &self,
 // ---------------------------------------------------------------------------
 
 /// utlx_async_store(src, dst, size)
+/// operands[0] = result slot (unused, void op); inputs start at [1].
 void utlx::createAsyncStore(TritonOpBuilder &self,
                             std::vector<mlir::Value> &operands) {
-  if (operands.size() < 3)
+  if (operands.size() < 4)
     return;
   createRuntimeOp(self.getBuilder(), self.getLastLoc(), "ttng.async_store", {},
-                  {operands[0], operands[1], operands[2]});
+                  {operands[1], operands[2], operands[3]});
 }
 
 /// utlx_fence(scope_str_as_i32_constant)
 /// scope is passed as an i32 constant: 0="gpu", 1="sys"
+/// operands[0] = result slot (unused, void op); the scope is operands[1].
 void utlx::createFence(TritonOpBuilder &self,
                        std::vector<mlir::Value> &operands) {
-  if (operands.size() < 1)
+  if (operands.size() < 2)
     return;
   auto &builder = self.getBuilder();
   auto loc = self.getLastLoc();
@@ -104,7 +129,7 @@ void utlx::createFence(TritonOpBuilder &self,
   // Decode scope from i32 constant
   llvm::StringRef scope = "gpu";
   if (auto constOp = mlir::dyn_cast_or_null<mlir::arith::ConstantIntOp>(
-          operands[0].getDefiningOp())) {
+          operands[1].getDefiningOp())) {
     if (constOp.value() == 1)
       scope = "sys";
   }
@@ -139,12 +164,13 @@ void utlx::createClusterSize1D(TritonOpBuilder &self,
 }
 
 /// utlx_async_clc_try_cancel(mbarAlloc, clcResAlloc)
+/// operands[0] = result slot (unused, void op); inputs start at [1].
 void utlx::createAsyncCLCTryCancel(TritonOpBuilder &self,
                                    std::vector<mlir::Value> &operands) {
-  if (operands.size() < 2)
+  if (operands.size() < 3)
     return;
   createRuntimeOp(self.getBuilder(), self.getLastLoc(),
-                  "ttng.async_clc_try_cancel", {}, {operands[0], operands[1]});
+                  "ttng.async_clc_try_cancel", {}, {operands[1], operands[2]});
 }
 
 /// utlx_clc_query_cancel(clcResAlloc) -> i32
@@ -206,21 +232,23 @@ void utlx::createAsyncTMAPrefetch(TritonOpBuilder &self,
 }
 
 /// utlx_named_barrier_arrive(bar, numThreads)
+/// operands[0] = result slot (unused, void op); inputs start at [1].
 void utlx::createNamedBarrierArrive(TritonOpBuilder &self,
                                     std::vector<mlir::Value> &operands) {
-  if (operands.size() < 2)
+  if (operands.size() < 3)
     return;
   createRuntimeOp(self.getBuilder(), self.getLastLoc(),
-                  "ttng.named_barrier_arrive", {}, {operands[0], operands[1]});
+                  "ttng.named_barrier_arrive", {}, {operands[1], operands[2]});
 }
 
 /// utlx_named_barrier_wait(bar, numThreads)
+/// operands[0] = result slot (unused, void op); inputs start at [1].
 void utlx::createNamedBarrierWait(TritonOpBuilder &self,
                                   std::vector<mlir::Value> &operands) {
-  if (operands.size() < 2)
+  if (operands.size() < 3)
     return;
   createRuntimeOp(self.getBuilder(), self.getLastLoc(),
-                  "ttng.named_barrier_wait", {}, {operands[0], operands[1]});
+                  "ttng.named_barrier_wait", {}, {operands[1], operands[2]});
 }
 
 // ---------------------------------------------------------------------------
@@ -248,17 +276,20 @@ void utlx::createReadBarrierPhase(TritonOpBuilder &self,
 ///   (runtime lookup of enum values; 0=RTNE, 1=RTZ, 2=RS for stochastic)
 void utlx::createFpToFpWithRbits(TritonOpBuilder &self,
                                  std::vector<mlir::Value> &operands) {
-  if (operands.size() < 3)
+  // operands[0] = result slot; [1] = a null value of the desired result type
+  // (the caller's type carrier); [2] = src; [3] = optional rbits; back() =
+  // rounding mode.
+  if (operands.size() < 4)
     return;
   auto &builder = self.getBuilder();
   auto loc = self.getLastLoc();
 
-  mlir::Value src = operands[1];
-  mlir::Value rbits = operands.size() > 3 ? operands[2] : mlir::Value();
+  mlir::Value src = operands[2];
+  mlir::Value rbits = operands.size() > 4 ? operands[3] : mlir::Value();
 
   // Build attributes
   llvm::SmallVector<mlir::NamedAttribute> attrs;
-  if (operands.size() > 3) {
+  if (operands.size() > 4) {
     // Last operand encodes rounding mode as i32 constant
     if (auto constOp = mlir::dyn_cast_or_null<mlir::arith::ConstantIntOp>(
             operands.back().getDefiningOp())) {
@@ -292,9 +323,10 @@ void utlx::createFpToFpWithRbits(TritonOpBuilder &self,
   if (rbits)
     opOperands.push_back(rbits);
 
-  // Result type matches src type (same shape, but potentially different elem)
-  // Caller must set up operands[0] type carrier for the desired result type
-  mlir::Type resultType = operands[0].getType();
+  // Result type comes from the caller's type carrier. It cannot come from
+  // operands[0]: that is the result slot the binding prepends, and it is a
+  // default-constructed (null) Value until this function assigns it.
+  mlir::Type resultType = operands[1].getType();
 
   auto *op = createRuntimeOp(builder, loc, "tt.fp_to_fp", {resultType},
                              opOperands, attrs);
