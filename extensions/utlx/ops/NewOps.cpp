@@ -627,10 +627,19 @@ void utlx::createAsyncLoad(TritonOpBuilder &self,
   mlir::Value other;
   if (useBulk) {
     // operands: [result_slot, src, result, bulk_size, barrier, useBulk=1]
-    if (operands.size() < 6)
-      return;
-    // The bulk form carries no mask/other; its size and barrier operands are
-    // not part of this op's signature.
+    //
+    // Bulk mode cannot be expressed here. Meta's fork extends this op with
+    // Optional<I32>:$bulkSize and Optional<TTG_MemDescType>:$barrier plus a
+    // useBulk attribute; upstream's takes only (src, result, mask, other).
+    // Building the upstream op and dropping the barrier would compile, and
+    // then hang on the GPU: callers pair a bulk load with barrier_wait on the
+    // barrier the copy was supposed to arrive at, and nothing would ever
+    // arrive. Fail at compile time instead -- a clear error beats a deadlock.
+    mlir::emitError(self.getLastLoc())
+        << "utlx: tlx.async_load(bulk=True) is not supported on upstream "
+           "Triton: ttg.async_copy_global_to_local has no bulkSize/barrier "
+           "operand, so the completion barrier cannot be tracked.";
+    return;
   } else {
     // Non-bulk: [result_slot, src, result, (mask)?, (other)?, useBulk=0].
     // Anything between result and the trailing flag is mask, then other.
