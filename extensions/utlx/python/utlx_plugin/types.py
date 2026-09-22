@@ -94,14 +94,29 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
         )
 
     def to_ir(self, builder: ir.builder) -> None:
-        return builder.make_swizzled_shared_encoding_attr(
+        # TLX calls make_swizzled_shared_encoding_attr, a fork-only builder
+        # method taking the legacy CTA triple (numCTAsPerCGA, numCTASplit,
+        # numCTAOrder). Upstream spells the same #ttg.swizzled_shared attribute
+        # get_swizzled_shared_layout and folds those three into one cga_layout
+        # argument -- a list of bases describing how CTAs tile each dimension,
+        # empty for a single CTA.
+        #
+        # uTLX only ever builds single-CTA layouts, which is exactly the empty
+        # case, so there is nothing to convert. A real multi-CTA tiling would
+        # have to be rewritten into bases; refuse it rather than silently
+        # emitting a single-CTA layout in its place.
+        if any(int(n) != 1 for n in self.numCTAsPerCGA):
+            raise NotImplementedError(
+                "swizzled_shared_layout_encoding: multi-CTA tilings are not "
+                f"supported on upstream Triton (numCTAsPerCGA="
+                f"{list(self.numCTAsPerCGA)}). Upstream describes CTA tiling "
+                "as layout bases rather than the CTA triple TLX uses.")
+        return builder.get_swizzled_shared_layout(
             self.vectorSize,
             self.perPhase,
             self.maxPhase,
             self.order,
-            self.numCTAsPerCGA,
-            self.numCTASplit,
-            self.numCTAOrder,
+            [],
         )
 
 
