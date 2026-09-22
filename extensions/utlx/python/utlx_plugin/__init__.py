@@ -322,13 +322,19 @@ def _make_tlx_op_builder():
 
 
 def _tag_module_num_warps(codegen):
-    """Set ``ttg.num-warps``/``ttg.threads-per-warp`` on the module early.
+    """Set ``ttg.num-warps``/``threads-per-warp``/``num-ctas`` early.
 
     tlx kernels attach ttgpu distributed layouts (e.g. ``nvidia_mma``) to
     tensors during TTIR construction. Triton's ``VerifyTensorLayoutsTrait``
     validates those layouts against the module's warp counts, which normally are
     only set later by ``convert-triton-to-tritongpu``. Set them up front (from
     the compile options) so the initial ``module.verify()`` succeeds.
+
+    ``ttg.num-ctas`` needs the same treatment for the same reason. Cluster ops
+    verify their CTA count as they are built -- ``ttng.cluster_barrier`` rejects
+    a module with ``ttg.num-ctas <= 1`` -- and the conversion pass that would
+    have set it does not run until after TTIR is complete. Without it every
+    clustered kernel fails to parse, however it was launched.
     """
     try:
         builder = codegen.builder
@@ -341,6 +347,9 @@ def _tag_module_num_warps(codegen):
         if module.get_int_attr("ttg.threads-per-warp") is None:
             module.set_attr("ttg.threads-per-warp",
                             builder.get_int32_attr(threads_per_warp))
+        num_ctas = int(getattr(options, "num_ctas", 1) or 1)
+        if module.get_int_attr("ttg.num-ctas") is None:
+            module.set_attr("ttg.num-ctas", builder.get_int32_attr(num_ctas))
     except (AttributeError, TypeError):
         pass
 
