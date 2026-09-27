@@ -115,6 +115,24 @@ if(NOT EXISTS "${TRITON_WHEEL_INCLUDE_DIR}/triton/Dialect/Triton/IR/TritonTypeEn
     target_compile_definitions(${TRITON_EXT_NAME} PRIVATE UTLX_TRITON_INT_ADDR_SPACE)
 endif()
 
+# ---------------------------------------------------------------------------
+# Triton release/3.8 compatibility: TMEMSubSliceOp's derived builder gained a
+# trailing `dim` parameter on Triton main. release/3.8 has only the 3-argument
+# form, whose builder hardcodes the last dimension -- the same one uTLX names
+# -- so the two are equivalent and only the arity differs. Both report
+# TRITON_VERSION "3.8.0", so probe the generated header for the signature.
+# ---------------------------------------------------------------------------
+set(_utlx_ttng_ops_inc
+    "${TRITON_WHEEL_INCLUDE_DIR}/triton/Dialect/TritonNvidiaGPU/IR/Ops.h.inc")
+if(EXISTS "${_utlx_ttng_ops_inc}")
+    file(STRINGS "${_utlx_ttng_ops_inc}" _utlx_tmem_dim_sig
+         REGEX "TMEMSubSliceOp create\\(.*Value alloc, int offset, int size, int")
+    if(NOT _utlx_tmem_dim_sig)
+        message(STATUS "uTLX: TMEMSubSliceOp has no dim parameter — enabling UTLX_TMEM_SUBSLICE_NO_DIM")
+        target_compile_definitions(${TRITON_EXT_NAME} PRIVATE UTLX_TMEM_SUBSLICE_NO_DIM)
+    endif()
+endif()
+
 # Shared compile flags + link-only-against-libtriton (single source of truth).
 target_link_libraries(${TRITON_EXT_NAME} PRIVATE triton_ext::plugin)
 # uTLX additionally disables C++ exceptions.

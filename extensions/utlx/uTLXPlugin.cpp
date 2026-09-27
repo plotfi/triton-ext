@@ -209,13 +209,24 @@ static void createTMEMSubSlice(TritonOpBuilder &self,
   // physical-layout dimension, or the leading pipeline dimension of a
   // multi-buffered descriptor. TLX's local_slice always takes columns, so
   // name the last dimension rather than relying on the default.
+  //
+  // release/3.8 predates that parameter and its builder hardcodes
+  // `shape.back() = size`, i.e. the last dimension -- the same one we would
+  // have named -- so the two paths agree and only the arity differs.
+  // UTLX_TMEM_SUBSLICE_NO_DIM is set by CMake when the header lacks the
+  // parameter.
   auto srcType = mlir::dyn_cast<ttg::MemDescType>(operands[1].getType());
   if (!srcType || srcType.getShape().empty())
     return;
-  int dim = static_cast<int>(srcType.getShape().size()) - 1;
 
+#ifdef UTLX_TMEM_SUBSLICE_NO_DIM
+  operands[0] = self.create<ttng::TMEMSubSliceOp>(
+      operands[1], static_cast<int>(*offset), static_cast<int>(*size));
+#else
+  int dim = static_cast<int>(srcType.getShape().size()) - 1;
   operands[0] = self.create<ttng::TMEMSubSliceOp>(
       operands[1], static_cast<int>(*offset), static_cast<int>(*size), dim);
+#endif
 }
 
 // --- utlx_memdesc_subslice: Rectangular subslice of a memdesc ---
